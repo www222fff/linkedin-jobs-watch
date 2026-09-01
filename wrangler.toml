@@ -1,0 +1,13 @@
+name = "linkedin-jobs-explorer"
+main = "src/index.js"
+compatibility_date = "2026-08-25"
+workers_dev = true
+account_id = "1dc37aea0d5455bfeccbd5e5abd96f55"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "65c93628a2524fe7b30ad43842767942"
+
+[[routes]]
+pattern = "linkedin.hashneuron.space"
+custom_domain = true
