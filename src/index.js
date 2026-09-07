@@ -32,6 +32,68 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function fetchWithRetry(url, options = {}, maxRetries = 5, baseDelayMs = 2000) {
+  let lastRes;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const reqOptions = {
+      ...options,
+      headers: { ...getRequestHeaders(), ...(options.headers || {}) }
+    };
+    lastRes = await fetch(url, reqOptions);
+    if (lastRes.ok || ![429, 502, 503, 504].includes(lastRes.status)) {
+      return lastRes;
+    }
+    if (attempt < maxRetries - 1) {
+      const retryAfterHeader = lastRes.headers.get('Retry-After');
+      let delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 800);
+      if (retryAfterHeader) {
+        const seconds = parseInt(retryAfterHeader, 10);
+        if (!Number.isNaN(seconds)) {
+          delay = seconds * 1000;
+        } else {
+          const retryDate = Date.parse(retryAfterHeader);
+          if (!Number.isNaN(retryDate)) {
+            delay = Math.max(0, retryDate - Date.now());
+          }
+        }
+      }
+      await sleep(Math.min(delay, 30000));
+    }
+  }
+  return lastRes;
+}
+
+function jsonResponse(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      ...extraHeaders
+    }
+  });
+}
+
+function buildRateLimitResponse(message, retryAfterSec = 30, extra = {}) {
+  return jsonResponse({
+    error: '请求过于频繁',
+    error_code: 'RATE_LIMIT',
+    message: message || 'LinkedIn 暂时限制了访问频率，请稍后再试。',
+    retry_after: retryAfterSec,
+    ...extra
+  }, 429);
+}
+
+async function getKvCache(env, cacheKey) {
+  if (!env?.KV) return null;
+  try {
+    return await env.KV.get(cacheKey, { type: 'json' });
+  } catch (e) {
+    console.warn('KV get cache error:', e);
+    return null;
+  }
+}
+
 function stripHtml(html) {
   if (!html) return '';
   return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -164,22 +226,12 @@ async function handleApiSearch(url, env, ctx) {
 
   // 1. Check KV Cache first (unless forceRefresh is set)
   if (env && env.KV && !forceRefresh) {
-    try {
-      const cached = await env.KV.get(cacheKey, { type: 'json' });
-      if (cached && Array.isArray(cached.jobs) && cached.jobs.length > 0) {
-        return new Response(JSON.stringify({
-          ...cached,
-          from_cache: true
-        }), {
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Access-Control-Allow-Origin': '*',
-            'X-Data-Source': 'KV-Cache'
-          }
-        });
-      }
-    } catch (e) {
-      console.warn('KV get cache error:', e);
+    const cached = await getKvCache(env, cacheKey);
+    if (cached && Array.isArray(cached.jobs) && cached.jobs.length > 0) {
+      return jsonResponse({
+        ...cached,
+        from_cache: true
+      }, 200, { 'X-Data-Source': 'KV-Cache' });
     }
   }
 
@@ -194,40 +246,33 @@ async function handleApiSearch(url, env, ctx) {
   if (jobType) targetUrl.searchParams.set('f_JT', jobType);
 
   try {
-    let res = await fetch(targetUrl.toString(), {
-      headers: getRequestHeaders()
-    });
-
-    // If rate limited, wait 800ms and try one more time
-    if (res.status === 429) {
-      await sleep(800);
-      res = await fetch(targetUrl.toString(), {
-        headers: getRequestHeaders()
-      });
-    }
+    const res = await fetchWithRetry(targetUrl.toString(), {}, 5, 2500);
 
     if (res.status === 429) {
-      return new Response(JSON.stringify({
-        error: 'LinkedIn Rate Limit (429)',
-        message: 'LinkedIn 对公开搜索频次有限制，已启用自动保护。请稍等几秒后再试。',
-        jobs: [],
-        from_cache: false
-      }), {
-        status: 429,
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
-      });
+      const cached = await getKvCache(env, cacheKey);
+      if (cached && Array.isArray(cached.jobs) && cached.jobs.length > 0) {
+        return jsonResponse({
+          ...cached,
+          from_cache: true,
+          stale_fallback: true,
+          notice: 'LinkedIn 访问频率受限，已展示最近一次缓存结果'
+        }, 200, { 'X-Data-Source': 'KV-Stale-Fallback' });
+      }
+      const retryAfter = parseInt(res.headers.get('Retry-After') || '30', 10);
+      return buildRateLimitResponse(
+        'LinkedIn 暂时限制了搜索频率。系统已自动重试，请等待片刻后再试，或稍后再点击搜索。',
+        Number.isNaN(retryAfter) ? 30 : retryAfter,
+        { jobs: [] }
+      );
     }
 
     if (!res.ok) {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         error: `LinkedIn HTTP ${res.status}`,
+        error_code: 'UPSTREAM_ERROR',
         message: `从 LinkedIn 获取数据失败 (${res.statusText})`,
-        jobs: [],
-        from_cache: false
-      }), {
-        status: res.status,
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
-      });
+        jobs: []
+      }, res.status);
     }
 
     const html = await res.text();
@@ -257,26 +302,17 @@ async function handleApiSearch(url, env, ctx) {
       }
     }
 
-    return new Response(JSON.stringify({
+    return jsonResponse({
       ...payload,
       from_cache: false
-    }), {
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'X-Data-Source': 'LinkedIn-Live'
-      }
-    });
+    }, 200, { 'X-Data-Source': 'LinkedIn-Live' });
   } catch (err) {
-    return new Response(JSON.stringify({
+    return jsonResponse({
       error: 'Fetch Exception',
+      error_code: 'NETWORK_ERROR',
       message: err.message,
-      jobs: [],
-      from_cache: false
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
-    });
+      jobs: []
+    }, 500);
   }
 }
 
@@ -296,44 +332,43 @@ async function handleApiDetail(url, env, ctx) {
 
   // 1. Check KV Cache first
   if (env && env.KV && !forceRefresh) {
-    try {
-      const cached = await env.KV.get(cacheKey, { type: 'json' });
-      if (cached && (cached.description_html || cached.criteria)) {
-        return new Response(JSON.stringify({
-          ...cached,
-          from_cache: true
-        }), {
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Access-Control-Allow-Origin': '*',
-            'X-Data-Source': 'KV-Cache'
-          }
-        });
-      }
-    } catch (e) {
-      console.warn('KV get detail cache error:', e);
+    const cached = await getKvCache(env, cacheKey);
+    if (cached && (cached.description_html || cached.criteria)) {
+      return jsonResponse({
+        ...cached,
+        from_cache: true
+      }, 200, { 'X-Data-Source': 'KV-Cache' });
     }
   }
 
   // 2. Fetch from LinkedIn detail endpoint
   const targetUrl = `https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${jobId}`;
   try {
-    let res = await fetch(targetUrl, {
-      headers: getRequestHeaders()
-    });
+    const res = await fetchWithRetry(targetUrl, {}, 5, 2500);
 
     if (res.status === 429) {
-      await sleep(800);
-      res = await fetch(targetUrl, {
-        headers: getRequestHeaders()
-      });
+      const cached = await getKvCache(env, cacheKey);
+      if (cached && (cached.description_html || cached.criteria)) {
+        return jsonResponse({
+          ...cached,
+          from_cache: true,
+          stale_fallback: true,
+          notice: 'LinkedIn 访问频率受限，已展示缓存的职位详情'
+        }, 200, { 'X-Data-Source': 'KV-Stale-Fallback' });
+      }
+      const retryAfter = parseInt(res.headers.get('Retry-After') || '30', 10);
+      return buildRateLimitResponse(
+        '职位详情加载受限，请稍后再试，或点击右上角前往 LinkedIn 查看原文。',
+        Number.isNaN(retryAfter) ? 30 : retryAfter
+      );
     }
 
     if (!res.ok) {
-      return new Response(JSON.stringify({ error: `LinkedIn detail returned ${res.status}`, from_cache: false }), {
-        status: res.status,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
+      return jsonResponse({
+        error: `LinkedIn detail returned ${res.status}`,
+        error_code: 'UPSTREAM_ERROR',
+        message: `职位详情获取失败 (${res.status})`
+      }, res.status);
     }
 
     const html = await res.text();
@@ -356,21 +391,16 @@ async function handleApiDetail(url, env, ctx) {
       }
     }
 
-    return new Response(JSON.stringify({
+    return jsonResponse({
       ...payload,
       from_cache: false
-    }), {
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'X-Data-Source': 'LinkedIn-Live'
-      }
-    });
+    }, 200, { 'X-Data-Source': 'LinkedIn-Live' });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message, from_cache: false }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    });
+    return jsonResponse({
+      error: err.message,
+      error_code: 'NETWORK_ERROR',
+      message: '职位详情加载失败，请稍后重试'
+    }, 500);
   }
 }
 
@@ -440,20 +470,8 @@ function getHtmlPage() {
             <span>LinkedIn 职位雷达</span>
             <span class="text-[10px] sm:text-xs font-semibold px-1.5 py-0.2 sm:px-2 sm:py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">Guest API</span>
           </h1>
-          <p class="text-[11px] sm:text-xs text-slate-400 truncate hidden sm:block">免登录实时检索 • Cloudflare KV 1天持久化缓存</p>
+          <p class="text-[11px] sm:text-xs text-slate-400 truncate hidden sm:block">免登录实时检索 • 一周以内职位筛选</p>
         </div>
-      </div>
-      <div class="flex items-center space-x-1.5 sm:space-x-3 text-[11px] sm:text-xs shrink-0">
-        <span id="cacheStatusBadge" class="hidden items-center gap-1 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-md bg-amber-500/10 text-amber-400 border border-amber-500/20">
-          <i class="fa-solid fa-bolt text-[10px]"></i>
-          <span class="hidden sm:inline">KV 缓存已命中</span>
-          <span class="sm:hidden">缓存</span>
-        </span>
-        <span class="inline-flex items-center gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-md bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          <span class="hidden sm:inline">KV 数据库就绪</span>
-          <span class="sm:hidden">就绪</span>
-        </span>
       </div>
     </div>
   </header>
@@ -563,9 +581,6 @@ function getHtmlPage() {
           <div class="flex items-center gap-2">
             <h2 class="text-xs sm:text-sm font-bold text-slate-200 uppercase tracking-wider">职位结果</h2>
             <span id="resultsCountBadge" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 border border-slate-700 text-slate-400">0 条</span>
-            <span id="cacheTag" class="hidden text-[10px] sm:text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 flex items-center gap-1">
-              <i class="fa-solid fa-database text-[10px]"></i> KV 1天缓存
-            </span>
           </div>
           <div id="pageIndicator" class="text-xs text-slate-400">第 1 页</div>
         </div>
@@ -575,7 +590,7 @@ function getHtmlPage() {
           <div class="p-8 text-center bg-slate-800/40 border border-dashed border-slate-700 rounded-2xl text-slate-400">
             <i class="fa-solid fa-magnifying-glass-location text-3xl mb-3 text-slate-500"></i>
             <p class="text-sm font-medium">点击上方搜索或选择快捷标签即可开始查找</p>
-            <p class="text-xs text-slate-500 mt-1">自动查询并同步持久化到 Cloudflare KV 数据库（保存 24 小时）</p>
+            <p class="text-xs text-slate-500 mt-1">支持中国 Remote / On-site 快捷筛选</p>
           </div>
         </div>
 
@@ -605,7 +620,7 @@ function getHtmlPage() {
             <i class="fa-regular fa-file-lines text-2xl"></i>
           </div>
           <h3 class="text-sm sm:text-base font-semibold text-slate-300">选择职位查看完整详情</h3>
-          <p class="text-xs text-slate-500 mt-1 max-w-sm">左侧点击任意职位卡片，优先从 KV 数据库毫秒级读取，未命中则实时请求 LinkedIn</p>
+          <p class="text-xs text-slate-500 mt-1 max-w-sm">点击左侧任意职位卡片即可查看完整岗位描述</p>
         </div>
 
         <div id="detailContent" class="hidden flex-col gap-4">
@@ -639,12 +654,6 @@ function getHtmlPage() {
               </div>
             </div>
 
-            <!-- Notice about LinkedIn China 451 -->
-            <div class="mt-3 px-3 py-2 sm:px-3.5 sm:py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-start gap-2 text-[11px] sm:text-xs text-amber-200/90 leading-relaxed">
-              <i class="fa-solid fa-triangle-exclamation text-amber-400 mt-0.5 shrink-0 text-xs sm:text-sm"></i>
-              <span><b>451 提示：</b>LinkedIn 官方检测到中国大陆直连 IP 时，会自动跳转至已停服的中国站并报错 451。点击投递前请确保浏览器代理已开启，或点击「复制链接」在代理环境中打开。</span>
-            </div>
-
             <!-- Badges & Criteria Tags -->
             <div id="detailCriteria" class="flex flex-wrap gap-1.5 sm:gap-2 mt-3.5 pt-3 border-t border-slate-700/60">
             </div>
@@ -662,7 +671,7 @@ function getHtmlPage() {
   <!-- Footer -->
   <footer class="border-t border-slate-800 py-4 text-center text-xs text-slate-500">
     <div class="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-      <p>Powered by LinkedIn Guest Jobs API • Cloudflare KV Caching (1-Day TTL) • Cloudflare Workers</p>
+      <p>Powered by LinkedIn Guest Jobs API • Cloudflare Workers</p>
       <p class="text-slate-600">仅供个人求职检索与技术验证使用</p>
     </div>
   </footer>
@@ -672,6 +681,83 @@ function getHtmlPage() {
     let selectedJobId = null;
     let currentJobs = [];
     let mobileCurrentView = 'list';
+    let detailRequestId = 0;
+    const DETAIL_FETCH_TIMEOUT_MS = 60000;
+    const DETAIL_FETCH_RETRIES = 3;
+    const MIN_SEARCH_INTERVAL_MS = 2500;
+    let lastSearchAt = 0;
+    let rateLimitTimer = null;
+
+    function clearRateLimitTimer() {
+      if (rateLimitTimer) {
+        clearInterval(rateLimitTimer);
+        rateLimitTimer = null;
+      }
+    }
+
+    function renderRateLimitNotice(container, message, retryAfter, onRetry, title = '访问频率受限') {
+      clearRateLimitTimer();
+      let remaining = Math.max(5, retryAfter || 30);
+
+      const render = () => {
+        container.innerHTML = \`
+          <div class="p-6 sm:p-8 bg-amber-500/10 border border-amber-500/25 rounded-2xl text-center">
+            <div class="w-12 h-12 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center mx-auto mb-3">
+              <i class="fa-solid fa-hourglass-half text-amber-300 text-xl"></i>
+            </div>
+            <h4 class="text-sm font-bold text-amber-200">\${escapeHtml(title)}</h4>
+            <p class="text-xs text-amber-100/80 mt-2 leading-relaxed max-w-md mx-auto">\${escapeHtml(message)}</p>
+            <p class="text-[11px] text-amber-300/70 mt-3">建议等待 <span id="rateLimitCountdown">\${remaining}</span> 秒后重试</p>
+            <button type="button" id="rateLimitRetryBtn" class="mt-4 px-4 py-2 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 text-xs font-semibold border border-amber-500/30 transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+              立即重试
+            </button>
+          </div>
+        \`;
+        const btn = container.querySelector('#rateLimitRetryBtn');
+        if (btn) {
+          btn.onclick = () => {
+            clearRateLimitTimer();
+            onRetry();
+          };
+        }
+      };
+
+      render();
+
+      rateLimitTimer = setInterval(() => {
+        remaining -= 1;
+        const countdownEl = container.querySelector('#rateLimitCountdown');
+        const btn = container.querySelector('#rateLimitRetryBtn');
+        if (countdownEl) countdownEl.textContent = String(Math.max(0, remaining));
+        if (remaining <= 0) {
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = '立即重试';
+          }
+          clearRateLimitTimer();
+          return;
+        }
+        if (btn) btn.textContent = \`等待 \${remaining}s 后重试\`;
+      }, 1000);
+    }
+
+    function renderGenericError(container, title, message) {
+      container.innerHTML = \`
+        <div class="p-6 bg-rose-500/10 border border-rose-500/20 rounded-xl text-center">
+          <i class="fa-solid fa-triangle-exclamation text-rose-400 text-2xl mb-2"></i>
+          <h4 class="text-sm font-bold text-rose-300">\${escapeHtml(title)}</h4>
+          <p class="text-xs text-rose-400 mt-1">\${escapeHtml(message)}</p>
+        </div>
+      \`;
+    }
+
+    function highlightFirstJob() {
+      if (currentJobs.length === 0) return;
+      selectedJobId = currentJobs[0].id;
+      renderJobList();
+      detailPlaceholder.classList.remove('hidden');
+      detailContent.classList.add('hidden');
+    }
 
     const searchForm = document.getElementById('searchForm');
     const refreshBtn = document.getElementById('refreshBtn');
@@ -686,8 +772,6 @@ function getHtmlPage() {
     const paginationContainer = document.getElementById('paginationContainer');
     const prevPageBtn = document.getElementById('prevPageBtn');
     const nextPageBtn = document.getElementById('nextPageBtn');
-    const cacheTag = document.getElementById('cacheTag');
-    const cacheStatusBadge = document.getElementById('cacheStatusBadge');
 
     const detailPlaceholder = document.getElementById('detailPlaceholder');
     const detailContent = document.getElementById('detailContent');
@@ -788,10 +872,23 @@ function getHtmlPage() {
 
       if (!kw) return;
 
+      const now = Date.now();
+      if (!forceRefresh && now - lastSearchAt < MIN_SEARCH_INTERVAL_MS) {
+        const waitSec = Math.ceil((MIN_SEARCH_INTERVAL_MS - (now - lastSearchAt)) / 1000);
+        renderRateLimitNotice(
+          jobListContainer,
+          \`操作过快容易触发 LinkedIn 限流，请等待 \${waitSec} 秒后再搜索。\`,
+          waitSec,
+          () => executeSearch(forceRefresh),
+          '请稍候'
+        );
+        return;
+      }
+      lastSearchAt = now;
+      clearRateLimitTimer();
+
       searchBtn.disabled = true;
       searchBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
-      cacheTag.classList.add('hidden');
-      cacheStatusBadge.classList.add('hidden');
 
       jobListContainer.innerHTML = \`
         <div class="space-y-2.5">
@@ -824,14 +921,18 @@ function getHtmlPage() {
         searchBtn.disabled = false;
         searchBtn.innerHTML = '<i class="fa-solid fa-magnifying-glass"></i><span class="text-xs md:hidden font-medium ml-1">搜索</span>';
 
+        if (res.status === 429 || data.error_code === 'RATE_LIMIT') {
+          renderRateLimitNotice(
+            jobListContainer,
+            data.message || 'LinkedIn 暂时限制了搜索频率，请稍后再试。',
+            data.retry_after || 30,
+            () => executeSearch(false)
+          );
+          return;
+        }
+
         if (data.error) {
-          jobListContainer.innerHTML = \`
-            <div class="p-6 bg-rose-500/10 border border-rose-500/20 rounded-xl text-center">
-              <i class="fa-solid fa-triangle-exclamation text-rose-400 text-2xl mb-2"></i>
-              <h4 class="text-sm font-bold text-rose-300">\${data.error}</h4>
-              <p class="text-xs text-rose-400 mt-1">\${data.message || '请求 LinkedIn 失败'}</p>
-            </div>
-          \`;
+          renderGenericError(jobListContainer, data.error, data.message || '请求 LinkedIn 失败');
           return;
         }
 
@@ -840,15 +941,20 @@ function getHtmlPage() {
         const mobileListCount = document.getElementById('mobileListCount');
         if (mobileListCount) mobileListCount.textContent = currentJobs.length.toString();
 
+        if (data.stale_fallback && data.notice) {
+          document.getElementById('searchNotice')?.remove();
+          const notice = document.createElement('div');
+          notice.id = 'searchNotice';
+          notice.className = 'mb-2.5 px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-200/90 flex items-start gap-2';
+          notice.innerHTML = '<i class="fa-solid fa-circle-info text-amber-300 mt-0.5"></i><span>' + escapeHtml(data.notice) + '</span>';
+          jobListContainer.parentElement.insertBefore(notice, jobListContainer);
+          setTimeout(() => notice.remove(), 8000);
+        }
+
         pageIndicator.textContent = \`第 \${Math.floor(currentStart / 25) + 1} 页\`;
         paginationContainer.classList.remove('hidden');
         prevPageBtn.disabled = currentStart === 0;
         nextPageBtn.disabled = currentJobs.length < 10;
-
-        if (data.from_cache) {
-          cacheTag.classList.remove('hidden');
-          cacheStatusBadge.classList.remove('hidden');
-        }
 
         if (currentJobs.length === 0) {
           jobListContainer.innerHTML = \`
@@ -862,23 +968,14 @@ function getHtmlPage() {
         }
 
         renderJobList();
-        // Automatically select the first job for desktop preview, but don't force mobile tab switch
-        if (currentJobs.length > 0) {
-          selectJob(currentJobs[0], false);
-        }
+        highlightFirstJob();
         if (window.innerWidth < 1024) {
           switchMobileView('list');
         }
       } catch (err) {
         searchBtn.disabled = false;
         searchBtn.innerHTML = '<i class="fa-solid fa-magnifying-glass"></i><span class="text-xs md:hidden font-medium ml-1">搜索</span>';
-        jobListContainer.innerHTML = \`
-          <div class="p-6 bg-rose-500/10 border border-rose-500/20 rounded-xl text-center">
-            <i class="fa-solid fa-circle-xmark text-rose-400 text-2xl mb-2"></i>
-            <h4 class="text-sm font-bold text-rose-300">网络请求错误</h4>
-            <p class="text-xs text-rose-400 mt-1">\${err.message}</p>
-          </div>
-        \`;
+        renderGenericError(jobListContainer, '网络请求错误', err.message);
       }
     }
 
@@ -929,7 +1026,57 @@ function getHtmlPage() {
       if (job) selectJob(job, true);
     };
 
+    async function fetchJobDetail(jobId) {
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= DETAIL_FETCH_RETRIES; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), DETAIL_FETCH_TIMEOUT_MS);
+
+        try {
+          const res = await fetch(\`/api/detail?id=\${jobId}\`, { signal: controller.signal });
+          clearTimeout(timer);
+
+          const data = await res.json();
+
+          if (res.status === 429 || data.error_code === 'RATE_LIMIT') {
+            const err = new Error(data.message || '职位详情加载受限，请稍后再试');
+            err.code = 'RATE_LIMIT';
+            err.retryAfter = data.retry_after || 30;
+            throw err;
+          }
+
+          if (data.description_html) {
+            return data;
+          }
+
+          if (data.error) {
+            lastError = new Error(data.message || data.error);
+            if (attempt < DETAIL_FETCH_RETRIES) {
+              await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+              continue;
+            }
+            throw lastError;
+          }
+
+          return data;
+        } catch (err) {
+          clearTimeout(timer);
+          if (err.code === 'RATE_LIMIT') throw err;
+          lastError = err;
+          if (attempt < DETAIL_FETCH_RETRIES) {
+            await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      throw lastError || new Error('详情加载失败');
+    }
+
     async function selectJob(job, fromUserClick = false) {
+      const requestId = ++detailRequestId;
       selectedJobId = job.id;
       renderJobList();
 
@@ -964,7 +1111,8 @@ function getHtmlPage() {
       detailBody.innerHTML = \`
         <div class="py-8 text-center text-slate-400">
           <i class="fa-solid fa-spinner fa-spin text-2xl text-blue-400 mb-2"></i>
-          <p class="text-xs">正在从 KV 数据库 / LinkedIn 获取岗位详情...</p>
+          <p class="text-xs">正在加载岗位详情，请稍候...</p>
+          <p class="text-[11px] text-slate-500 mt-1">部分职位响应较慢，最长等待约 60 秒</p>
         </div>
       \`;
 
@@ -974,8 +1122,9 @@ function getHtmlPage() {
       }
 
       try {
-        const res = await fetch(\`/api/detail?id=\${job.id}\`);
-        const data = await res.json();
+        const data = await fetchJobDetail(job.id);
+        if (requestId !== detailRequestId) return;
+
         if (data.description_html) {
           detailBody.innerHTML = data.description_html;
           
@@ -988,22 +1137,27 @@ function getHtmlPage() {
               detailCriteria.appendChild(tag);
             }
           }
-
-          if (data.from_cache) {
-            const cacheSpan = document.createElement('span');
-            cacheSpan.className = 'px-2.5 py-1 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-medium';
-            cacheSpan.innerHTML = '<i class="fa-solid fa-bolt mr-1"></i> KV 缓存秒级响应';
-            detailCriteria.appendChild(cacheSpan);
-          }
         } else {
           detailBody.innerHTML = \`
             <p class="text-sm text-slate-400">未获取到正文内容，您可以直接点击右上角前往 LinkedIn 官方页面查看。</p>
           \`;
         }
       } catch (e) {
-        detailBody.innerHTML = \`
-          <p class="text-xs text-rose-400">详情加载失败：\${e.message}。请点击右上角前往 LinkedIn 原文查看。</p>
-        \`;
+        if (requestId !== detailRequestId) return;
+        if (e.code === 'RATE_LIMIT') {
+          renderRateLimitNotice(
+            detailBody,
+            e.message,
+            e.retryAfter || 30,
+            () => selectJob(job, true),
+            '详情加载受限'
+          );
+          return;
+        }
+        const message = e.name === 'AbortError'
+          ? '加载超时，请稍后重试或点击右上角前往 LinkedIn 原文查看。'
+          : \`详情加载失败：\${e.message}。请点击右上角前往 LinkedIn 原文查看。\`;
+        renderGenericError(detailBody, '加载失败', message);
       }
     }
 
